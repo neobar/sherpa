@@ -122,7 +122,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Sequence, Union
+from typing import Any, Callable, Literal, Mapping, Optional, Sequence, \
+    Union, cast, overload
 import warnings
 
 import numpy as np
@@ -138,7 +139,7 @@ from sherpa.utils import pad_bounding_box, interpolate, \
 from sherpa.utils.err import ArgumentTypeErr, DataErr, ImportErr
 from sherpa.utils import formatting
 from sherpa.utils.numeric_types import SherpaFloat
-from sherpa.utils.types import IdType
+from sherpa.utils.types import ArrayType, IdType, ModelFunc, StatErrFunc
 
 # There are currently (Sep 2015) no tests that exercise the code that
 # uses the compile_energy_grid symbols.
@@ -168,6 +169,10 @@ except ImportError:
 
 __all__ = ('DataARF', 'DataRMF', 'DataPHA', 'DataIMG', 'DataIMGInt', 'DataRosatRMF')
 
+
+AnalysisType = Literal["channel", "energy", "wavelength"]
+
+RateType = Literal["counts", "rate"]
 
 # can arf/rmf be sent ARF1D/RMF1D too?
 #
@@ -1041,6 +1046,8 @@ class DataRMF(DataOgipResponse):
         must be in increasing or decreasing order.
     n_grp, f_chan, n_chan, matrix : array-like
     offset : int, optional
+        This must be 0 or greater. This maps to the TLMIN value of
+        the F_CHAN column (when reading from a FITS file).
     e_min, e_max : array-like or None, optional
     header : dict or None, optional
     ethresh : number or None, optional
@@ -1065,8 +1072,13 @@ class DataRMF(DataOgipResponse):
                  header=None, ethresh=None):
         energ_lo, energ_hi = self._validate(name, energ_lo, energ_hi, ethresh)
 
+        # Check it's an integer.
+        if not float(offset).is_integer():
+            raise ValueError(f"offset must be an integer, not {offset}")
+
         if offset < 0:
             raise ValueError(f"offset must be >=0, not {offset}")
+
         self.energ_lo = energ_lo
         self.energ_hi = energ_hi
         self.offset = offset
@@ -1181,20 +1193,36 @@ class DataRMF(DataOgipResponse):
         return rmf_fold(src, self._grp, self._fch, self._nch, self._rsp,
                         self.detchans, self.offset)
 
+    @overload
+    def notice(self, noticed_chans: None) -> None:
+        ...
+
+    @overload
+    def notice(self, noticed_chans: np.ndarray) -> np.ndarray:
+        ...
+
+    # Note that noticed_chans is not a mask, but the channel values.
     def notice(self, noticed_chans=None):
-        bin_mask = None
+        """Filter the response to match the requested channels."""
+
         self._fch = self.f_chan
         self._nch = self.n_chan
         self._grp = self.n_grp
         self._rsp = self.matrix
         self._lo = self.energ_lo
         self._hi = self.energ_hi
-        if noticed_chans is not None:
-            (self._grp, self._fch, self._nch, self._rsp,
-             bin_mask) = filter_resp(noticed_chans, self.n_grp, self.f_chan,
-                                     self.n_chan, self.matrix, self.offset)
-            self._lo = self.energ_lo[bin_mask]
-            self._hi = self.energ_hi[bin_mask]
+
+        # This could also return here if noticed_chans contains all
+        # channels, but that is harder to check.
+        #
+        if noticed_chans is None:
+            return None
+
+        (self._grp, self._fch, self._nch, self._rsp,
+         bin_mask) = filter_resp(noticed_chans, self.n_grp, self.f_chan,
+                                 self.n_chan, self.matrix, self.offset)
+        self._lo = self.energ_lo[bin_mask]
+        self._hi = self.energ_hi[bin_mask]
         return bin_mask
 
     def get_indep(self, filter=False):
@@ -1527,10 +1555,93 @@ class DataPHA(Data1D):
     _related_fields = Data1D._related_fields + ("bin_lo", "bin_hi", "counts", "grouping", "quality",
                                                 "backscal", "areascal")
 
-    def _get_grouped(self):
+    def __init__(self,
+                 name: str,
+                 channel: Optional[ArrayType],
+                 counts: Optional[ArrayType],
+                 staterror: Optional[ArrayType] = None,
+                 syserror: Optional[ArrayType] = None,
+                 bin_lo: Optional[ArrayType] = None,
+                 bin_hi: Optional[ArrayType] = None,
+                 grouping: Optional[ArrayType] = None,
+                 quality: Optional[ArrayType] = None,
+                 exposure=None,
+                 backscal=None,
+                 areascal=None,
+                 header: Optional[Mapping[str, Any]] = None
+                 ) -> None:
+
+        # Set the size of the object as soon as we know (it makes it
+        # easier to get usable error messages when checking the
+        # related fields). This is only done for the channel case to
+        # allow the counts field to be set but the channel field
+        # unset.
+        #
+        channel = _check(channel)
+        if channel is not None:
+            self._size = len(channel)
+
+        counts = _check(counts)
+
+        # Assert types: is there a better way to do this?
+        #
+        self._bin_lo: Optional[np.ndarray]
+        self._bin_hi: Optional[np.ndarray]
+        self._grouping: Optional[np.ndarray]
+        self._quality: Optional[np.ndarray]
+        self._quality_filter: Optional[np.ndarray]
+
+        self.bin_lo = _check(bin_lo)
+        self.bin_hi = _check(bin_hi)
+        self.quality = _check(quality)
+        self.grouping = _check(grouping)
+        self.exposure = exposure
+        self.backscal = backscal
+        self.areascal = areascal
+        if header is None:
+            header = {"HDUCLASS": "OGIP", "HDUCLAS1": "SPECTRUM",
+                      "HDUCLAS2": "TOTAL", "HDUCLAS3": "TYPE:I",
+                      "HDUCLAS4": "COUNT", "HDUVERS": "1.2.1",
+                      "TELESCOP": "none", "INSTRUME": "none",
+                      "FILTER": "none", "POISSERR": True}
+
+        self.header = header
+        self._grouped = grouping is not None
+
+        # _original_groups is set False if the grouping is changed via
+        # the _dynamic_groups method. This is currently only used by the
+        # serialization code (sherpa.astro.ui.serialize) to determine
+        # whether to write out the grouping data.
+        #
+        self._original_groups = True
+        self._subtracted = False
+        self._response_ids: list[IdType] = []
+        self._background_ids: list[IdType] = []
+
+        # Can these responses be ARF1D / RMF1D too? For now use just
+        # DataARF/DataRMF. Since the response versions actually just
+        # send any call to the underlying Data object it technically
+        # is the correct typing, and avoids playing around with
+        # self-referential type imports for now.
+        #
+        self._responses: dict[IdType, tuple[Optional[DataARF],
+                                            Optional[DataRMF]]] = {}
+
+        self._backgrounds: dict[IdType, DataPHA] = {}
+        self._rate = True
+        self._plot_fac = 0
+        self.units = "channel"
+        self.quality_filter = None
+        super().__init__(name, channel, counts, staterror, syserror)
+
+        # special-case the labels
+        self._xlabel = None
+        self._ylabel = None
+
+    def _get_grouped(self) -> bool:
         return self._grouped
 
-    def _set_grouped(self, val):
+    def _set_grouped(self, val: bool) -> None:
         val = bool(val)
 
         if val and self.grouping is None:
@@ -1563,10 +1674,10 @@ class DataPHA(Data1D):
     grouped = property(_get_grouped, _set_grouped,
                        doc='Are the data grouped?')
 
-    def _get_subtracted(self):
+    def _get_subtracted(self) -> bool:
         return self._subtracted
 
-    def _set_subtracted(self, val):
+    def _set_subtracted(self, val: bool) -> None:
         val = bool(val)
         if len(self._backgrounds) == 0:
             raise DataErr('nobkg', self.name)
@@ -1575,29 +1686,20 @@ class DataPHA(Data1D):
     subtracted = property(_get_subtracted, _set_subtracted,
                           doc='Are the background data subtracted?')
 
-    def _get_units(self):
-        return self._units
-
-    def _set_units(self, val):
+    def _set_units(self, val: str) -> None:
         units = str(val).strip().lower()
 
         if units == 'bin':
             units = 'channel'
 
         if units.startswith('chan'):
-            # Note: the names of these routines appear confusing because of the
-            #       way group values are used
-            self._from_channel = self._group_to_channel
             units = 'channel'
 
         elif units.startswith('ener'):
-            self._from_channel = self._channel_to_energy
             units = 'energy'
 
         elif units.startswith('wave'):
-            self._from_channel = self._channel_to_wavelength
             units = 'wavelength'
-
         else:
             raise DataErr('bad', 'quantity', val)
 
@@ -1609,13 +1711,16 @@ class DataPHA(Data1D):
 
         self._units = units
 
+    def _get_units(self) -> AnalysisType:
+        return cast(AnalysisType, self._units)
+
     units = property(_get_units, _set_units,
                      doc="Units of the independent axis: one of 'channel', 'energy', 'wavelength'.")
 
-    def _get_rate(self):
+    def _get_rate(self) -> bool:
         return self._rate
 
-    def _set_rate(self, val):
+    def _set_rate(self, val: bool) -> None:
         self._rate = bool_cast(val)
         for bkg_id in self.background_ids:
             self.get_background(bkg_id).rate = val
@@ -1626,10 +1731,10 @@ class DataPHA(Data1D):
 When True the y axis is normalised by the exposure time to display
 a rate.""")
 
-    def _get_plot_fac(self):
+    def _get_plot_fac(self) -> int:
         return self._plot_fac
 
-    def _set_plot_fac(self, val):
+    def _set_plot_fac(self, val: int) -> None:
         # I'd prefer to check whether val is an integer, but there may
         # be users who have set the value to 2.0 and it doesn't seem
         # worth breaking that code. We do however want to error out if
@@ -1699,71 +1804,28 @@ If set, the identifiers must already exist, and any other backgrounds
 will be removed. The identifiers can be integers or strings.
 """)
 
-    def __init__(self, name, channel, counts, staterror=None, syserror=None,
-                 bin_lo=None, bin_hi=None, grouping=None, quality=None,
-                 exposure=None, backscal=None, areascal=None, header=None
-                 ) -> None:
+    @overload
+    def _set_related(self,
+                     attr: str,
+                     val: Optional[ArrayType],
+                     check_mask: bool = True,
+                     allow_scalar: object = Literal[False],
+                     **kwargs
+                     ) -> None:
+        ...
 
-        # Set the size of the object as soon as we know (it makes it
-        # easier to get usable error messages when checking the
-        # related fields). This is only done for the channel case to
-        # allow the counts field to be set but the channel field
-        # unset.
-        #
-        channel = _check(channel)
-        if channel is not None:
-            self._size = len(channel)
+    @overload
+    def _set_related(self,
+                     attr: str,
+                     val: float,
+                     check_mask: bool = True,
+                     allow_scalar: object = Literal[True],
+                     **kwargs
+                     ) -> None:
+        ...
 
-        counts = _check(counts)
-
-        self.bin_lo = bin_lo
-        self.bin_hi = bin_hi
-        self.quality = quality
-        self.grouping = grouping
-        self.exposure = exposure
-        self.backscal = backscal
-        self.areascal = areascal
-        if header is None:
-            header = {"HDUCLASS": "OGIP", "HDUCLAS1": "SPECTRUM",
-                      "HDUCLAS2": "TOTAL", "HDUCLAS3": "TYPE:I",
-                      "HDUCLAS4": "COUNT", "HDUVERS": "1.2.1",
-                      "TELESCOP": "none", "INSTRUME": "none",
-                      "FILTER": "none", "POISSERR": True}
-
-        self.header = header
-        self._grouped = grouping is not None
-
-        # _original_groups is set False if the grouping is changed via
-        # the _dynamic_groups method. This is currently only used by the
-        # serialization code (sherpa.astro.ui.serialize) to determine
-        # whether to write out the grouping data.
-        #
-        self._original_groups = True
-        self._subtracted = False
-        self._response_ids = []
-        self._background_ids = []
-
-        # Can these responses be ARF1D / RMF1D too? For now use just
-        # DataARF/DataRMF. Since the response versions actually just
-        # send any call to the underlying Data object it technically
-        # is the correct typing, and avoids playing around with
-        # self-referential type imports for now.
-        #
-        self._responses: dict[IdType, tuple[Optional[DataARF],
-                                            Optional[DataRMF]]] = {}
-
-        self._backgrounds: dict[IdType, DataPHA] = {}
-        self._rate = True
-        self._plot_fac = 0
-        self.units = "channel"
-        self.quality_filter = None
-        super().__init__(name, channel, counts, staterror, syserror)
-
-        # special-case the labels
-        self._xlabel = None
-        self._ylabel = None
-
-    def _set_related(self, attr, val, check_mask=True, allow_scalar=False):
+    def _set_related(self, attr, val, check_mask=True,
+                     allow_scalar=False, **kwargs):
         """Set a field that must match the independent axes size.
 
         The value can be None, a scalar (if allow_scalar is set), or
@@ -1782,12 +1844,17 @@ will be removed. The identifiers can be integers or strings.
             setattr(self, f"_{attr}", val)
             return
 
-        super()._set_related(attr, val, check_mask=check_mask)
+        # At this point val is an iterable, but it can be hard for the
+        # type checker to know this, so convert to an ndarray to make
+        # sure.
+        #
+        super()._set_related(attr, np.asarray(val),
+                             check_mask=check_mask)
 
     # Set up the aliases for channel and counts
     #
     @property
-    def channel(self):
+    def channel(self) -> Optional[np.ndarray]:
         """The channel array.
 
         This is the first, and only, element of the indep attribute.
@@ -1795,11 +1862,18 @@ will be removed. The identifiers can be integers or strings.
         return self.indep[0]
 
     @channel.setter
-    def channel(self, val):
-        self.indep = (val, )
+    def channel(self, val: Optional[ArrayType]) -> None:
+        # This case is handled by _check but type checkers may not
+        # recognize it, so handle separately.
+        #
+        if val is None:
+            self.indep = (None, )
+            return
+
+        self.indep = (_check(val), )
 
     @property
-    def counts(self):
+    def counts(self) -> Optional[np.ndarray]:
         """The counts array.
 
         This is an alias for the y attribute.
@@ -1807,14 +1881,14 @@ will be removed. The identifiers can be integers or strings.
         return self.y
 
     @counts.setter
-    def counts(self, val):
+    def counts(self, val: Optional[np.ndarray]):
         self.y = val
 
     # Override the mask handling because the mask matches the grouped
     # data length, not the independent axis.
     #
     @Data1D.mask.setter
-    def mask(self, val):
+    def mask(self, val: Union[ArrayType, bool]) -> None:
 
         # We only need to over-ride the behavior if the data is
         # grouped and val is a sequence (so we test with isscalar
@@ -1835,7 +1909,7 @@ will be removed. The identifiers can be integers or strings.
     # Set up the properties for the related fields
     #
     @property
-    def bin_lo(self):
+    def bin_lo(self) -> Optional[np.ndarray]:
         """The lower edge of each channel, in Angstroms, or None.
 
         The values are expected to be in descending order. This is
@@ -1844,11 +1918,11 @@ will be removed. The identifiers can be integers or strings.
         return self._bin_lo
 
     @bin_lo.setter
-    def bin_lo(self, val):
+    def bin_lo(self, val: Optional[ArrayType]) -> None:
         self._set_related("bin_lo", val)
 
     @property
-    def bin_hi(self):
+    def bin_hi(self) -> Optional[np.ndarray]:
         """The upper edge of each channel, in Angstroms, or None.
 
         The values are expected to be in descending order, with the
@@ -1858,11 +1932,11 @@ will be removed. The identifiers can be integers or strings.
         return self._bin_hi
 
     @bin_hi.setter
-    def bin_hi(self, val):
+    def bin_hi(self, val: Optional[ArrayType]) -> None:
         self._set_related("bin_hi", val)
 
     @property
-    def grouping(self):
+    def grouping(self) -> Optional[np.ndarray]:
         """The grouping data.
 
         A group is indicated by a sequence of flag values starting
@@ -1889,7 +1963,7 @@ will be removed. The identifiers can be integers or strings.
         return self._grouping
 
     @grouping.setter
-    def grouping(self, val):
+    def grouping(self, val: Optional[ArrayType]) -> None:
         # _set_related checks if it's a scalar value, so we just need
         # to check it's convertible to ndarray.
         #
@@ -1931,7 +2005,7 @@ will be removed. The identifiers can be integers or strings.
                 self.notice(*vals)
 
     @property
-    def quality(self):
+    def quality(self) -> Optional[np.ndarray]:
         """The quality data.
 
         A quality value of 0 indicates a good channel, otherwise
@@ -1952,7 +2026,7 @@ will be removed. The identifiers can be integers or strings.
         return self._quality
 
     @quality.setter
-    def quality(self, val):
+    def quality(self, val: Optional[ArrayType]) -> None:
         # _set_related checks if it's a scalar value, so we just need
         # to check it's convertible to ndarray.
         #
@@ -1968,6 +2042,41 @@ will be removed. The identifiers can be integers or strings.
         # quality_filter?
         #
         self._set_related("quality", val)
+
+    # It is unclear exactly what the quality_filter is meant to
+    # represent, so as part of improving support for ignore_bad, add
+    # some semantics.
+    #
+    @property
+    def quality_filter(self) -> Optional[np.ndarray]:
+        """The applied quality filter.
+
+        If set, this indicates which channels are currently selected
+        (a True value) and those that are ignored (False) by a
+        `ignore_bad` call.
+
+        Returns
+        -------
+        quality_filter : numpy.ndarray or None
+
+        See Also
+        --------
+        ignore_bad, quality
+
+        """
+        return self._quality_filter
+
+    # TODO: should this be allowed? Maybe this should only be set
+    # internally with ignore_bad?
+    #
+    @quality_filter.setter
+    def quality_filter(self, val: Optional[ArrayType]) -> None:
+        if val is None:
+            qfilt = None
+        else:
+            # ensure we store boolean values
+            qfilt = np.asarray(val, dtype=bool)
+        self._set_related("quality_filter", qfilt)
 
     @property
     def areascal(self):
@@ -2000,7 +2109,6 @@ will be removed. The identifiers can be integers or strings.
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        del state['_from_channel']
         return state
 
     def __setstate__(self, state):
@@ -2015,7 +2123,10 @@ will be removed. The identifiers can be integers or strings.
     primary_response_id: IdType = 1
     """The identifier for the response component when not set."""
 
-    def set_analysis(self, quantity, type='rate', factor=0):
+    def set_analysis(self,
+                     quantity: str,
+                     type: RateType = 'rate',
+                     factor: int = 0) -> None:
         """Set the units used when fitting and plotting spectral data.
 
         Parameters
@@ -2076,7 +2187,7 @@ will be removed. The identifiers can be integers or strings.
 
         self.units = quantity
 
-    def get_analysis(self):
+    def get_analysis(self) -> AnalysisType:
         """Return the units used when fitting spectral data.
 
         Returns
@@ -2423,7 +2534,7 @@ will be removed. The identifiers can be integers or strings.
 
         Parameters
         ----------
-        response_id : int or None, optional
+        response_id : int, str, or None, optional
             The response to use when units are not "channel". The
             default is to use the default response identifier.
         group : bool, optional
@@ -2479,12 +2590,21 @@ will be removed. The identifiers can be integers or strings.
         >>> (wlo == glo).all()
         True
         """
-        group = bool_cast(group)
+
+        if self.size is None:
+            raise DataErr("sizenotset", self.name)
+
+        # This is primarily to make the type checker happy, since it
+        # is expected to be called with channels set.
+        #
+        if self.channel is None:
+            raise DataErr(f"data set '{self.name}' has no channel information")
 
         if self.units == 'channel':
             elo = self.channel
             ehi = self.channel + 1
         elif (self.bin_lo is not None) and (self.bin_hi is not None):
+            # TODO: review whether bin_lo/hi should over-ride the response
             elo = self.bin_lo
             ehi = self.bin_hi
             if (elo[0] > elo[-1]) and (ehi[0] > ehi[-1]):
@@ -2504,7 +2624,7 @@ will be removed. The identifiers can be integers or strings.
                 elo = self.channel
                 ehi = self.channel + 1
 
-        if self.grouped and group:
+        if self.grouped and bool_cast(group):
             elo = self.apply_grouping(elo, self._min)
             ehi = self.apply_grouping(ehi, self._max)
 
@@ -2518,13 +2638,23 @@ will be removed. The identifiers can be integers or strings.
         #
         return (elo, ehi)
 
-    def get_indep(self, filter=True):
+    def get_indep(self,
+                  filter: bool = True
+                  ) -> Union[tuple[np.ndarray, ...],
+                             tuple[None, ...]]:
+
+        # short-cut if no data
+        if self.size is None:
+            return (None,)
+
         if filter:
             return (self.get_noticed_channels(),)
 
         return (self.channel,)
 
-    def _get_indep(self, filter=False):
+    def _get_indep(self,
+                   filter: bool = False
+                   ) -> tuple[np.ndarray, np.ndarray]:
         """Return the low and high edges of the independent axis.
 
         Unlike _get_ebins, this returns values in the "native" space
@@ -2634,51 +2764,6 @@ will be removed. The identifiers can be integers or strings.
             hi = hc / elo
 
         return (lo, hi)
-
-    def _group_to_channel(self, val, group=True, response_id=None):
-        """Convert group number to channel number.
-
-        For ungrouped data channel and group numbering are the
-        same. The mid-point of each group is used (rounded down
-        if not an integer).
-        """
-
-        if not self.grouped or not group:
-            return val
-
-        # The middle channel of each group.
-        #
-        mid = self.apply_grouping(self.channel, self._middle)
-
-        # Convert to an integer (this keeps the channel within
-        # the group).
-        #
-        mid = np.floor(mid)
-        val = np.asarray(val).astype(np.int_) - 1
-        try:
-            return mid[val]
-        except IndexError:
-            raise DataErr(f'invalid group number: {val}') from None
-
-    def _channel_to_energy(self, val, group=True, response_id=None):
-        elo, ehi = self._get_ebins(response_id=response_id, group=group)
-        val = np.asarray(val).astype(np.int_) - 1
-        try:
-            return (elo[val] + ehi[val]) / 2.0
-        except IndexError:
-            raise DataErr('invalidchannel', val) from None
-
-    def _channel_to_wavelength(self, val, group=True, response_id=None):
-        tiny = np.finfo(np.float32).tiny
-        vals = np.asarray(self._channel_to_energy(val, group, response_id))
-        if vals.shape == ():
-            if vals == 0.0:
-                vals = tiny
-        else:
-            vals[vals == 0.0] = tiny
-
-        vals = hc / vals
-        return vals
 
     default_background_id: IdType = 1
     """The identifier for the background component when not set.
@@ -3076,6 +3161,18 @@ It is an integer or string.
 
         return self._check_scale(self.areascal, group, filter)
 
+    @overload
+    def apply_filter(self,
+                     data: None,
+                     groupfunc: Callable) -> None:
+        ...
+
+    @overload
+    def apply_filter(self,
+                     data: ArrayType,
+                     groupfunc: Callable) -> np.ndarray:
+        ...
+
     def apply_filter(self, data, groupfunc=np.sum):
         """Group and filter the supplied data to match the data set.
 
@@ -3186,7 +3283,9 @@ It is an integer or string.
 
             mask = self.get_mask()
             if mask is None:
-                raise DataErr("mismatchn", "data", "array", nelem, ndata)
+                # All elements have been filtered out, so error out.
+                #
+                raise DataErr("notmask")
 
             nfiltered = mask.sum()
             if nfiltered != ndata:
@@ -3218,6 +3317,18 @@ It is an integer or string.
         # "effective size" property?
         #
         return self._data_space.filter.apply(gdata)
+
+    @overload
+    def apply_grouping(self,
+                       data: None,
+                       groupfunc: Callable) -> None:
+        ...
+
+    @overload
+    def apply_grouping(self,
+                       data: ArrayType,
+                       groupfunc: Callable) -> np.ndarray:
+        ...
 
     def apply_grouping(self, data, groupfunc=np.sum):
         """Apply the grouping scheme of the data set to the supplied data.
@@ -3349,7 +3460,7 @@ It is an integer or string.
         groups = np.asarray(groups)[filter]
         return do_group(filtered_data, groups, groupfunc.__name__)
 
-    def ignore_bad(self):
+    def ignore_bad(self) -> None:
         """Exclude channels marked as bad.
 
         Ignore any bin in the PHA data set which has a quality value
@@ -3396,7 +3507,9 @@ It is an integer or string.
         # self.quality_filter used for pre-grouping filter
         self.quality_filter = qual_flags
 
-    def _dynamic_group(self, group_func, *args, **kwargs):
+    def _dynamic_group(self,
+                       group_func: Union[Callable, str],
+                       *args, **kwargs) -> None:
         """Group the data using the given function and arguments.
 
         In order to support the grouping module being optional this
@@ -3428,6 +3541,13 @@ It is an integer or string.
         for key in keys:
             if kwargs[key] is None:
                 kwargs.pop(key)
+
+        # This routine only makes sense to be called if channel and
+        # counts are set. It is more to provide help to the type
+        # checkers than anything.
+        #
+        if self.channel is None or self.counts is None:
+            raise DataErr(f"data set '{self.name}' can not be grouped as channel or counts is not set")
 
         # If tabstops is given then we want to ensure it is an
         # ndarray.  Really this should be done on args as well, in
@@ -3478,7 +3598,7 @@ It is an integer or string.
         self.group()
         self._original_groups = False
 
-    def group_bins(self, num, tabStops=None):
+    def group_bins(self, num, tabStops=None) -> None:
         """Group into a fixed number of bins.
 
         Combine the data so that there `num` equal-width bins (or
@@ -3527,7 +3647,7 @@ It is an integer or string.
         self._dynamic_group("grpNumBins", len(self.channel), num,
                             tabStops=tabStops)
 
-    def group_width(self, val, tabStops=None):
+    def group_width(self, val, tabStops=None) -> None:
         """Group into a fixed bin width.
 
         Combine the data so that each bin contains `num` channels.
@@ -3575,7 +3695,7 @@ It is an integer or string.
         self._dynamic_group("grpBinWidth", len(self.channel), val,
                             tabStops=tabStops)
 
-    def group_counts(self, num, maxLength=None, tabStops=None):
+    def group_counts(self, num, maxLength=None, tabStops=None) -> None:
         """Group into a minimum number of counts per bin.
 
         Combine the data so that each bin contains `num` or more
@@ -3646,7 +3766,7 @@ It is an integer or string.
                             maxLength=maxLength, tabStops=tabStops)
 
     # DOC-TODO: see discussion in astro.ui.utils regarding errorCol
-    def group_snr(self, snr, maxLength=None, tabStops=None, errorCol=None):
+    def group_snr(self, snr, maxLength=None, tabStops=None, errorCol=None) -> None:
         """Group into a minimum signal-to-noise ratio.
 
         Combine the data so that each bin has a signal-to-noise ratio
@@ -3706,7 +3826,7 @@ It is an integer or string.
                             maxLength=maxLength, tabStops=tabStops,
                             errorCol=errorCol)
 
-    def group_adapt(self, minimum, maxLength=None, tabStops=None):
+    def group_adapt(self, minimum, maxLength=None, tabStops=None) -> None:
         """Adaptively group to a minimum number of counts.
 
         Combine the data so that each bin contains `num` or more
@@ -3763,7 +3883,7 @@ It is an integer or string.
 
     # DOC-TODO: see discussion in astro.ui.utils regarding errorCol
     def group_adapt_snr(self, minimum, maxLength=None, tabStops=None,
-                        errorCol=None):
+                        errorCol=None) -> None:
         """Adaptively group to a minimum signal-to-noise ratio.
 
         Combine the data so that each bin has a signal-to-noise ratio
@@ -3927,7 +4047,9 @@ It is an integer or string.
 
         return bkgsum / SherpaFloat(nbkg)
 
-    def get_dep(self, filter=False):
+    def get_dep(self,
+                filter: bool = False
+                ) -> Optional[np.ndarray]:
         # FIXME: Aneta says we need to group *before* subtracting, but that
         # won't work (I think) when backscal is an array
         # if not self.subtracted:
@@ -3975,7 +4097,10 @@ It is an integer or string.
     # is available and is subtracted.
     #
 
-    def get_staterror(self, filter=False, staterrfunc=None):
+    def get_staterror(self,
+                      filter: bool = False,
+                      staterrfunc: Optional[StatErrFunc] = None
+                      ) -> Optional[np.ndarray]:
         """Return the statistical error.
 
         The staterror column is used if defined, otherwise the
@@ -4172,7 +4297,9 @@ It is an integer or string.
         statvar = staterr * staterr + bkgvar * src_scale * src_scale
         return np.sqrt(statvar)
 
-    def get_syserror(self, filter=False):
+    def get_syserror(self,
+                     filter: bool = False
+                     ) -> Optional[np.ndarray]:
         """Return any systematic error.
 
         Parameters
@@ -4198,10 +4325,30 @@ It is an integer or string.
 
         return syserr
 
-    def get_x(self, filter=False, response_id=None):
+    def get_x(self,
+              filter: bool = False,
+              response_id: Optional[IdType] = None
+              ) -> Optional[np.ndarray]:
+        if self.channel is None:
+            return None
+
         # We want the full channel grid with no grouping.
         #
-        return self._from_channel(self.channel, group=False, response_id=response_id)
+        if self.units == "channel":
+            return self.channel
+
+        elo, ehi = self._get_ebins(response_id=response_id, group=False)
+        emid = (elo + ehi) / 2
+
+        if self.units == "energy":
+            return emid
+
+        # The units must be wavelength.
+        #
+        tiny = np.finfo(np.float32).tiny
+        # In case there are any 0-energy bins replace them
+        emid[emid == 0.0] = tiny
+        return hc / emid
 
     def get_xlabel(self) -> str:
         """The label for the independent axis.
@@ -4231,7 +4378,7 @@ It is an integer or string.
 
         return xlabel
 
-    def _set_initial_quantity(self):
+    def _set_initial_quantity(self) -> None:
         arf, rmf = self.get_response()
 
         # Change analysis if ARFs equal or of higher resolution to
@@ -4246,9 +4393,23 @@ It is an integer or string.
                 raise DataErr("incompatibleresp", rmf.name, self.name)
             self.units = 'energy'
 
-    def _fix_y_units(self, val, filter=False,
+    @overload
+    def _fix_y_units(self,
+                     val: None,
+                     filter: bool = False,
                      response_id: Optional[IdType] = None
-                     ) -> Optional[np.ndarray]:
+                     ) -> None:
+        ...
+
+    @overload
+    def _fix_y_units(self,
+                     val: ArrayType,
+                     filter: bool = False,
+                     response_id: Optional[IdType] = None
+                     ) -> np.ndarray:
+        ...
+
+    def _fix_y_units(self, val, filter=False, response_id=None):
         """Rescale the data to match the 'y' axis."""
 
         if val is None:
@@ -4321,37 +4482,60 @@ It is an integer or string.
         val *= np.power(xmid, self.plot_fac)
         return val
 
+    @overload
+    def get_y(self,
+              filter: bool,
+              yfunc: None,
+              response_id: Optional[IdType] = None,
+              use_evaluation_space: bool = False
+              ) -> np.ndarray:
+        ...
+
+    @overload
+    def get_y(self,
+              filter: bool,
+              yfunc: ModelFunc,
+              response_id: Optional[IdType] = None,
+              use_evaluation_space: bool = False
+              ) -> tuple[np.ndarray, np.ndarray]:
+        ...
+
+    # Note that use_evaluation_space is unused.
+    #
     def get_y(self, filter=False, yfunc=None, response_id=None,
               use_evaluation_space=False):
-        vallist = Data.get_y(self, yfunc=yfunc)
+
+        vals = Data.get_y(self, yfunc=yfunc)
+        vallist = (vals,) if yfunc is None else vals
+
         filter = bool_cast(filter)
-
-        if not isinstance(vallist, tuple):
-            vallist = (vallist,)
-
-        newvallist = []
-
+        out = []
         for val in vallist:
             if filter:
                 val = self.apply_filter(val)
             else:
                 val = self.apply_grouping(val)
             val = self._fix_y_units(val, filter, response_id)
-            newvallist.append(val)
+            out.append(val)
 
-        if len(vallist) == 1:
-            vallist = newvallist[0]
-        else:
-            vallist = tuple(newvallist)
+        if yfunc is None:
+            return out[0]
 
-        return vallist
+        return tuple(out)
 
-    def get_yerr(self, filter=False, staterrfunc=None, response_id=None):
+    def get_yerr(self,
+                 filter: bool = False,
+                 staterrfunc: Optional[Callable] = None,
+                 response_id: Optional[IdType] = None
+                 ) -> Optional[np.ndarray]:
         filter = bool_cast(filter)
         err = self.get_error(filter, staterrfunc)
         return self._fix_y_units(err, filter, response_id)
 
-    def get_xerr(self, filter=False, response_id=None):
+    def get_xerr(self,
+                 filter: bool = False,
+                 response_id: Optional[IdType] = None
+                 ) -> Optional[np.ndarray]:
         """Returns an X "error".
 
         The error value for the independent axis is not well defined
@@ -4366,7 +4550,7 @@ It is an integer or string.
         ----------
         filter : bool, optional
            Should the values be filtered to the current notice range?
-        response_id : int or None, optional
+        response_id : int, str, or None, optional
            What response should be used?
 
         Returns
@@ -4464,8 +4648,12 @@ It is an integer or string.
     def _sum_sq(array):
         return np.sqrt(np.sum(array * array))
 
-    def get_noticed_channels(self):
+    def get_noticed_channels(self) -> np.ndarray:
         """Return the noticed channels.
+
+        .. versionchanged:: 4.17.0
+           An empty array is now returned if the filter removes all
+           channels and an error is now raised if the data is empty.
 
         Returns
         -------
@@ -4474,10 +4662,16 @@ It is an integer or string.
             analysis setting).
 
         """
+
+        if self.size is None:
+            raise DataErr("sizenotset", self.name)
+
         chans = self.channel
+
+        # get_mask returns None if all the data has been filtered.
         mask = self.get_mask()
         if mask is None:
-            return chans
+            return np.asarray([], dtype=chans.dtype)
 
         # This is added to address issue #361
         #
@@ -4492,8 +4686,13 @@ It is an integer or string.
 
         return chans[mask]
 
-    def get_mask(self):
+    def get_mask(self) -> Optional[np.ndarray]:
         """Returns the (ungrouped) mask.
+
+        .. versionchanged:: 4.17.0
+           When all channels are selected the routine now returns an
+           array rather than None, and it is an error to call it on an
+           empty data set (one whose channel field has not been set).
 
         Returns
         -------
@@ -4501,22 +4700,34 @@ It is an integer or string.
             The mask, in channels, or None.
 
         """
-        groups = self.grouping
+
+        if self.size is None:
+            raise DataErr("sizenotset", self.name)
+
+        # I am not convinced that self.mask will always be an array if
+        # quality filtering is in use, so do not assume that for now.
+        #
         if self.mask is False:
             return None
 
-        if self.mask is True or not self.grouped:
-            if self.quality_filter is not None:
-                return self.quality_filter
-            if np.iterable(self.mask):
-                return self.mask
-            return None
+        if self.mask is True:
+            if self.quality_filter is None:
+                return np.ones(self.size, dtype=bool)
 
+            return self.quality_filter.copy()
+
+        if not self.grouped:
+            mask = self.mask.copy()
+            # This does not apply the quality filter
+            return mask
+
+        groups = self.grouping
         if self.quality_filter is not None:
             groups = groups[self.quality_filter]
+
         return expand_grouped_mask(self.mask, groups)
 
-    def get_noticed_expr(self):
+    def get_noticed_expr(self) -> str:
         """Returns the current set of noticed channels.
 
         The values returned are always in channels, no matter the
@@ -4536,7 +4747,7 @@ It is an integer or string.
 
         """
         chans = self.get_noticed_channels()
-        if self.mask is False or len(chans) == 0:
+        if len(chans) == 0:
             return 'No noticed channels'
 
         return create_expr(chans, format='%i')
@@ -4549,6 +4760,11 @@ It is an integer or string.
         """Return the data filter as a string.
 
         The filter expression depends on the analysis setting.
+
+        .. versionchanged:: 4.17.0
+           The routine now always returns the empty string if all the
+           data has been filtered out, rather than sometimes returning
+           the phrase "No noticed bins".
 
         .. versionchanged:: 4.14.0
            Prior to 4.14.0 the filter used the mid-point of the bin,
@@ -4571,7 +4787,7 @@ It is an integer or string.
             ranges, where the low and high values are separated by
             the `delim` string. The units of the ranges are controlled
             by the analysis setting. If all bins have been
-            filtered out then "No noticed bins" is returned.
+            filtered out then the empty string is returned.
 
         See Also
         --------
@@ -4621,22 +4837,19 @@ It is an integer or string.
         >>> pha.get_filter(format='%.2f', delim='-')
         '0.47-2.09,2.28-6.57'
 
+        >>> pha.ignore()
+        >>> pha.get_filter()
+        ''
+
         """
-        if self.mask is False:
-            return 'No noticed bins'
 
         # We use get_noticed_channels since it includes quality
         # filtering, which the 'self.mask is True' check below does
         # not make.
         #
         chans = self.get_noticed_channels()
-
-        # Special case all data has been masked. Should it
-        # error out or return either '' or 'No noticed bins'?
-        #
         if len(chans) == 0:
-            # raise DataErr('notmask')
-            # return 'No noticed bins'
+            # This catches both self.mask=False and self.mask=[False] * nchan
             return ''
 
         # Special case all channels are selected.
@@ -4699,7 +4912,10 @@ It is an integer or string.
         return (self.get_filter(format='%.4f', delim='-') +
                 ' ' + self.get_xlabel())
 
-    def notice_response(self, notice_resp=True, noticed_chans=None):
+    def notice_response(self,
+                        notice_resp: bool = True,
+                        noticed_chans: Optional[np.ndarray] = None
+                        ) -> None:
         notice_resp = bool_cast(notice_resp)
 
         if notice_resp and noticed_chans is None:
@@ -4709,17 +4925,24 @@ It is an integer or string.
             arf, rmf = self.get_response(resp_id)
             _notice_resp(noticed_chans, arf, rmf)
 
-    def notice(self, lo=None, hi=None, ignore=False,
+    def notice(self,
+               lo: Optional[float] = None,
+               hi: Optional[float] = None,
+               ignore: bool = False,
                bkg_id: Optional[Union[IdType, Sequence[IdType]]] = None
                ) -> None:
         """Notice or ignore the given range.
+
+        Select or remove a range of channels when analyzing the data.
+        The units for the range, that is the values for the lo and hi
+        argument, is set by the analysis field.
 
         .. versionchanged:: 4.14.0
            PHA filtering has been improved to fix a number of corner
            cases which can result in the same filter now selecting one
            or two fewer channels that done in earlier versions of
-           Sherpa. The ``lo`` and ``hi`` arguments are now restricted based on
-           the units setting.
+           Sherpa. The ``lo`` and ``hi`` arguments are now restricted
+           based on the units setting.
 
         Parameters
         ----------
@@ -4964,7 +5187,7 @@ It is an integer or string.
                 self.get_xlabel(),
                 self.get_ylabel())
 
-    def group(self):
+    def group(self) -> None:
         """Group the data according to the data set's grouping scheme.
 
         This sets the grouping flag which means that the value of the
@@ -4991,7 +5214,7 @@ It is an integer or string.
             except DataErr as exc:
                 info(str(exc))
 
-    def ungroup(self):
+    def ungroup(self) -> None:
         """Remove any data grouping.
 
         This un-sets the grouping flag which means that the grouping
@@ -5015,7 +5238,7 @@ It is an integer or string.
             bkg = self.get_background(bkg_id)
             bkg.grouped = False
 
-    def subtract(self):
+    def subtract(self) -> None:
         """Subtract the background data.
 
         See Also
@@ -5024,7 +5247,7 @@ It is an integer or string.
         """
         self.subtracted = True
 
-    def unsubtract(self):
+    def unsubtract(self) -> None:
         """Remove background subtraction.
 
         See Also

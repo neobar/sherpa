@@ -165,17 +165,7 @@ def test_filter_bad_notice_361(make_data_path):
     stats = setup_model(make_data_path)
 
     ui.ignore_bad()
-
-    # With support for #1558 - writing out the filter as we apply them
-    # - we now get this call failing, so catch this failure to allow
-    # the test to continue. This should be fixed, but it's a
-    # long-standing problem.
-    #
-    try:
-        ui.notice(0.5, 8.0)
-    except IndexError:
-        pass
-
+    ui.notice(0.5, 8)
     s1 = ui.calc_stat()
     assert s1 == pytest.approx(stats['0.5-8.0'])
 
@@ -288,12 +278,10 @@ def test_filter_bad_grouped(make_data_path, clean_astro_ui, caplog):
     # What happens when we filter the data? Unlike #1169
     # we do change the noticed range.
     #
-    # This should create a filter message, but thanks to ignore_bad we
-    # get an IndexError, which has been caught and that causes the
-    # filter message to not be displayed.
-    #
     ui.notice(0.5, 7)
-    assert len(caplog.records) == 1
+    assert len(caplog.records) == 2
+    check_last_caplog(caplog, "sherpa.ui.utils",
+                      logging.ERROR, "dataset 1: 1D filter has failed")
 
     assert pha.quality_filter == pytest.approx(expected)
 
@@ -607,22 +595,36 @@ def test_notice_reporting_data2d(session, caplog):
     assert s.get_filter() == ""
 
     # At the moment it's not obvious what the arguments mean, so just
-    # act as a regression test. In particular, we get no caplog output.
+    # act as a regression test.
     #
     s.notice(lo=13)
-    assert len(caplog.record_tuples) == 0
+    assert len(caplog.record_tuples) == 1
+    check_last_caplog(caplog, "sherpa.ui.utils",
+                      logging.ERROR, "dataset 1: 1D filter has failed")
+
     assert s.get_filter() == ""
 
     s.ignore(6, 15)
-    assert len(caplog.record_tuples) == 0
+    assert len(caplog.record_tuples) == 2
+    check_last_caplog(caplog, "sherpa.ui.utils",
+                      logging.ERROR, "dataset 1: 1D filter has failed")
+
     assert s.get_filter() == ""
 
     s.notice_id(1, 13, 15)
-    assert len(caplog.record_tuples) == 0
+    assert len(caplog.record_tuples) == 3
+    check_last_caplog(caplog, "sherpa.ui.utils",
+                      logging.ERROR, "dataset 1: 1D filter has failed")
+
     assert s.get_filter() == ""
 
+    # It's not clear this filter message is correct, but it's not
+    # really obvious what we want to happen here anyway.
+    #
     s.ignore_id(1)
-    assert len(caplog.record_tuples) == 0
+    assert len(caplog.record_tuples) == 4
+    clc_filter(caplog, "dataset 1: <broken> -> no data")
+
     assert s.get_filter() == ""
 
 
@@ -683,3 +685,89 @@ def test_notice2d_reporting(caplog):
     s.ignore2d()
     assert len(caplog.record_tuples) == 7
     clc_filter(caplog, "dataset 1: no data (unchanged)")
+
+
+def test_ignore_bad_simple_comparison(caplog):
+    """A PHA grouped with one-channel per group should match no grouping.
+
+    However, at present there are differences
+    """
+
+    s = AstroSession()
+
+    counts = [9, 8, 7, 6, 5]
+    for idval in [1, 2]:
+        s.load_arrays(idval, [1, 2, 3, 4, 5], counts, DataPHA)
+        s.set_quality(idval, [0, 2, 0, 0, 0])
+
+    s.set_grouping(2, [1, 1, 1, 1, 1])
+    s.group(2)
+
+    for idval in [1, 2]:
+        assert s.get_dep(idval, filter=True) == pytest.approx(counts)
+        assert s.get_filter() == "1:5"
+
+        d = s.get_data(idval)
+        assert d.mask is True
+        assert d.get_mask() == pytest.approx([True] * 5)
+
+    assert len(caplog.records) == 2
+    s.ignore_bad(1)
+    s.ignore_bad(2)
+    assert len(caplog.records) == 4
+
+    r = caplog.records[2]
+    assert r.name == "sherpa.ui.utils"
+    assert r.levelname == "INFO"
+    assert r.getMessage() == "dataset 1: 1:5 -> 1,3:5 Channel"
+
+    r = caplog.records[3]
+    assert r.name == "sherpa.ui.utils"
+    assert r.levelname == "INFO"
+    assert r.getMessage() == "dataset 2: 1:5 Channel (unchanged)"
+
+    filtered_counts = [9, 7, 6, 5]
+    for idval in [1, 2]:
+        assert s.get_dep(idval, filter=True) == pytest.approx(filtered_counts)
+
+    assert s.get_filter(1) == "1,3:5"
+    assert s.get_filter(2) == "1:5"
+
+    mask = [True] + [False] + [True] * 3
+    d1 = s.get_data(1)
+    assert d1.mask == pytest.approx(mask)
+    assert d1.get_mask() == pytest.approx(mask)
+
+    d2 = s.get_data(2)
+    assert d2.mask is True
+    assert d2.get_mask() == pytest.approx(mask)
+
+    s.ignore(lo=4)
+    assert len(caplog.records) == 6
+
+    r = caplog.records[4]
+    assert r.name == "sherpa.ui.utils"
+    assert r.levelname == "INFO"
+    assert r.getMessage() == "dataset 1: 1,3:5 -> 1,3 Channel"
+
+    r = caplog.records[5]
+    assert r.name == "sherpa.ui.utils"
+    assert r.levelname == "INFO"
+    assert r.getMessage() == "dataset 2: 1:5 -> 1:3 Channel"
+
+    filtered_counts = [9, 7]
+    for idval in [1, 2]:
+        assert s.get_dep(idval, filter=True) == pytest.approx(filtered_counts)
+
+    assert s.get_filter(1) == "1,3"
+    assert s.get_filter(2) == "1:3"
+
+    mask = [True] + [False] + [True] + [False] * 2
+    d1 = s.get_data(1)
+    assert d1.mask == pytest.approx(mask)
+    assert d1.get_mask() == pytest.approx(mask)
+
+    mask = [True] * 2 + [False] * 2
+    d2 = s.get_data(2)
+    assert d2.mask == pytest.approx(mask)
+    assert d2.get_mask() == pytest.approx(mask)

@@ -640,8 +640,13 @@ def check_write_pha_fits_with_extras_roundtrip_crates(path, etime, bscal):
     c0 = cr.get_column(0)
     assert c0.name == "CHANNEL"
     assert c0.values.dtype == np.int64
+
+    # The CHANNEL data range is 1-4 but the header contains
+    # DETCHANS=10, so the data does not really make sense. What should
+    # be written out?
+    #
     assert c0.get_tlmin() == 1
-    assert c0.get_tlmax() == 10
+    assert c0.get_tlmax() == 4
 
     c1 = cr.get_column(1)
     assert c1.name == "COUNTS"
@@ -758,8 +763,12 @@ def check_write_pha_fits_with_extras_roundtrip_pyfits(path, etime, bscal):
         for key in ["AREASCAL", "QUALITY", "GROUPING"]:
             assert key not in hdu.header
 
+        # The CHANNEL data range is 1-4 but the header contains
+        # DETCHANS=10, so the data does not really make sense. What
+        # should be written out?
+        #
         assert hdu.header["TLMIN1"] == 1
-        assert hdu.header["TLMAX1"] == 10
+        assert hdu.header["TLMAX1"] == 4
 
     finally:
         hdus.close()
@@ -784,7 +793,8 @@ def test_write_pha_fits_with_extras_roundtrip(tmp_path, caplog):
 
     hdr = {"TELESCOP": "CHANDRA", "INSTRUME": "ACIS", "FILTER": "NONE",
            "CHANTYPE": "PI",
-           "DETCHANS": 10,  # This intentionally does not match the data
+           # DETCHANS intentionally does not match the data, so what gets written out?
+           "DETCHANS": 10,
            "OBJECT": "Made up source",
            "CORRFILE": "None",
            # This will cause a warning when reading in the file
@@ -1450,3 +1460,68 @@ def test_read_pha_object(make_data_path):
     assert pha.get_rmf().matrix.max() == pytest.approx(0.1611403226852417)
 
     assert pha.get_background().counts[-1] == pytest.approx(59)
+
+
+@requires_fits
+def test_roundtrip_channel0(tmp_path):
+    """Check what happens if we write out and read back in channel 0.
+
+    This is a regression test.
+    """
+
+    pha = DataPHA("chan0", [0, 1, 2], [2, 5, 9])
+    pha.exposure = 12.0
+    pha.backscal = 1.2
+    pha.areascal = 0.4
+
+    outfile = str(tmp_path / "out.pha")
+    io.write_pha(outfile, pha, ascii=False)
+    pha = None
+
+    pha2 = io.read_pha(outfile)
+    assert pha2.channel == pytest.approx([0, 1, 2])
+    assert pha2.counts == pytest.approx([2, 5, 9])
+    assert pha2.exposure == pytest.approx(12)
+    assert pha2.backscal == pytest.approx(1.2)
+    assert pha2.areascal == pytest.approx(0.4)
+
+
+@requires_fits
+def test_write_pha_with_bad_quality(tmp_path):
+    """If ignore_bad has been called what is written out?"""
+
+    # This gives groups of
+    #
+    # | channel | counts | filtered |
+    # | ------- | ------ | -------- |
+    # |  1 - 3  |   12   |     8    |
+    # |  4 - 5  |   18   |    18    |
+    # |    6    |   12   |    12    |
+    # |    7    |   14   |    14    |
+    # |  8 - 9  |   34   |     -    |
+    #
+    chans = np.arange(1, 10)
+    counts = chans * 2
+    group = [1, -1, -1, 1, -1, 1, 1, 1, -1]
+    quality = [0, 5, 0, 0, 0, 0, 0, 2, 2]
+    qfilt = [True, False] + [True] * 5 + [False] * 2
+
+    pha0 = DataPHA("qual", chans, counts, grouping=group,
+                   quality=quality)
+    pha0.ignore_bad()
+    assert pha0.quality_filter == pytest.approx(qfilt)
+
+    outpath = tmp_path / "test.pha"
+    outfile = str(outpath)
+    io.write_pha(outfile, pha0, ascii=False, clobber=True)
+
+    # Check that the quality filter field hasn't changed
+    assert pha0.quality_filter == pytest.approx(qfilt)
+
+    # Ensure all rows are written out
+    pha1 = io.read_pha(outfile)
+    assert pha1.channel == pytest.approx(chans)
+    assert pha1.counts == pytest.approx(counts)
+    assert pha1.grouping == pytest.approx(group)
+    assert pha1.quality == pytest.approx(quality)
+    assert pha1.quality_filter is None

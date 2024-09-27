@@ -1,5 +1,5 @@
 #
-#  Copyright (C) 2017, 2018, 2020, 2021, 2022, 2024
+#  Copyright (C) 2017, 2018, 2020 - 2022, 2024
 #  Smithsonian Astrophysical Observatory
 #
 #
@@ -21,9 +21,11 @@
 import re
 
 import numpy as np
+
 import pytest
 
 from sherpa.astro.data import DataPHA, DataIMG, DataIMGInt
+from sherpa.astro.instrument import matrix_to_rmf
 from sherpa.astro import ui
 from sherpa.astro import utils
 from sherpa.astro.utils import do_group, expand_grouped_mask, filter_resp, \
@@ -66,6 +68,133 @@ def test_rmf_filter_no_chans(make_data_path):
     with pytest.raises(ValueError,
                        match="There are no noticed channels"):
         rmf.notice([])
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2, 5])
+@pytest.mark.parametrize("selected,ng,fch,nch,mat,msk",
+                         [([1],
+                           [],
+                           [],
+                           [],
+                           [],
+                           [False] * 6),
+                          ([2],
+                           [1, 1],
+                           [2, 2],
+                           [1, 2],
+                           # There is an argument to say this should
+                           # just return [1, 1.2] as the 1.8 factor is
+                           # for channel 3. Do we just return all the
+                           # elements of a group if any element in the
+                           # group is needed?
+                           #
+                           [1, 1.2, 1.8],
+                           [False] + [True] * 2 + [False] * 3),
+                          ([3],
+                           [1, 1, 1, 1],
+                           [2, 2, 3, 3],
+                           [1, 2, 1, 2],
+                           [1, 1.2, 1.8, 2.0, 3.3, 3.7],
+                           [False] + [True] * 4 + [False]),
+                          ([4],
+                           [1, 1, 1, 1],
+                           [2, 3, 3, 4],
+                           [2, 1, 2, 1],
+                           [1.2, 1.8, 2.0, 3.3, 3.7, 4.0],
+                           [False] * 2 + [True] * 4),
+                          ([5],
+                           # Why is this not empty?
+                           [1, 1],
+                           [3, 4],
+                           [2, 1],
+                           [3.3, 3.7, 4.0],
+                           [False] * 4 + [True] * 2),
+                          ([1, 2],
+                           [1, 1],
+                           [2, 2],
+                           [1, 2],
+                           [1, 1.2, 1.8],
+                           [False] + [True] * 2 + [False] * 3),
+                          ([2, 3],
+                           [1, 1, 1, 1],
+                           [2, 2, 3, 3],
+                           [1, 2, 1, 2],
+                           [1, 1.2, 1.8, 2.0, 3.3, 3.7],
+                           [False] + [True] * 4 + [False]),
+                          ([1, 2, 3],
+                           [1, 1, 1, 1],
+                           [2, 2, 3, 3],
+                           [1, 2, 1, 2],
+                           [1, 1.2, 1.8, 2.0, 3.3, 3.7],
+                           [False] + [True] * 4 + [False]),
+                          ([3, 4],
+                           [1, 1, 1, 1, 1],
+                           [2, 2, 3, 3, 4],
+                           [1, 2, 1, 2, 1],
+                           [1, 1.2, 1.8, 2.0, 3.3, 3.7, 4.0],
+                           # Why does this include bin 2?
+                           [False] + [True] * 5),
+                          ([1, 5],
+                           # Assume this matches [5]
+                           [1, 1],
+                           [3, 4],
+                           [2, 1],
+                           [3.3, 3.7, 4.0],
+                           [False] * 4 + [True] * 2),
+                          ([2, 4],
+                           [1, 1, 1, 1, 1],
+                           [2, 2, 3, 3, 4],
+                           [1, 2, 1, 2, 1],
+                           [1, 1.2, 1.8, 2.0, 3.3, 3.7, 4.0],
+                           [False] + [True] * 5),
+                          ])
+def test_filter_resp_basics(offset, selected, ng, fch, nch, mat, msk):
+    """Check filter_resp behaves as expected.
+
+    There is no documentation in the code to say what the expected
+    behaviour is. The belief is that, given a list of channels we
+    are interested in we can
+
+    - restrict to just the subset of the matrix that can change
+      these fields
+    - provide a mask for the matrix ENERG_LO/HI columns so that model
+      evaluation can be restricted to just this range
+
+    See also
+    sherpa/astro/tests/test_astro_data2.py::test_rmf_offset_check_basics
+
+    """
+
+    # 6 energy grid values and 5 channels
+    #
+    # Note that the first row is empty and the rows do not sum to 1.0
+    # - this could represent a RSP, but it's actually just to
+    # make it obvious what values are being used.
+    #
+    fm = np.asarray([[0.0, 0.0, 0.0, 0.0, 0.0],
+                     [0.0, 1.0, 0.0, 0.0, 0.0],
+                     [0.0, 1.2, 1.8, 0.0, 0.0],
+                     [0.0, 0.0, 2.0, 0.0, 0.0],
+                     [0.0, 0.0, 3.3, 3.7, 0.0],
+                     [0.0, 0.0, 0.0, 4.0, 0.0]])
+
+    n_grp, f_chan, n_chan, matrix = matrix_to_rmf(fm, startchan=offset)
+
+    # Correct for the offset.
+    #
+    delta = offset - 1
+    nchans = np.asarray(selected) + delta
+
+    # The filter_resp command is sent the noticed channel numbers.
+    #
+    resp = filter_resp(nchans, n_grp, f_chan, n_chan, matrix, offset)
+    n_grp2, f_chan2, n_chan2, matrix2, mask2 = resp
+
+    assert n_grp2 == pytest.approx(ng)
+    assert f_chan2 == pytest.approx(np.asarray(fch) + delta)
+    assert n_chan2 == pytest.approx(nch)
+    assert matrix2 == pytest.approx(mat)
+    assert mask2 == pytest.approx(msk)
 
 
 @pytest.mark.parametrize("lo, hi, expected",
@@ -277,7 +406,15 @@ def make_data(data_class):
     if data_class == "imgint":
         return DataIMGInt('imgi', x0, x1, x0 + 1, x1 + 1, y, shape=(2, 3))
 
+    # This would indicate an error in the test setup.
     assert False
+
+
+def test_qual_setting():
+    """Regression test."""
+
+    pha = make_data("qual")
+    assert pha.quality_filter == pytest.approx([True, True, False, True])
 
 
 @pytest.mark.parametrize("data_class", ["1d", "1dint", "pha", "grp", "qual"])
@@ -513,6 +650,61 @@ def test_calc_data_sum_filtered_pha_grouped(frange, expected, data_class):
     assert not data.mask
     assert utils.calc_data_sum(data, *frange) == expected
     assert not data.mask
+
+
+@pytest.mark.parametrize("frange,expected", [((0, 10), 14),
+                                             ((0, 4), 14),
+                                             ((2, 3), 9),
+                                             ((2, 10), 14),
+                                             ((1, 1), 5),
+                                             ((2, 2), 5),
+                                             ((3, 3), 4),  # this is technically filtered-out by bad quality
+                                             ((4, 4), 5),
+                                             ((3, 4), 9),
+                                             ((3, 5), 9),
+                                             ((3, 12), 9),
+                                             ((1, 13), 14),
+                                             ((20, 22), 0)])
+@pytest.mark.parametrize("ignore_args",
+                         [{"hi": 2}, {"lo": 2},
+                          {"lo": 1, "hi": 1},
+                          # channel 3 is the bad-quality channel so filter
+                          # just this as a test
+                          {"lo": 3, "hi": 3}
+                          ])
+def test_calc_data_sum_pha_bad_quality_and_filter(frange, expected, ignore_args):
+    """Regression test of ignore_bad handling."""
+
+    pha = make_data("qual")
+    assert pha.quality_filter is not None
+
+    # ignore_bad has been called which ignores channel 3.
+
+    assert pha.mask is True
+    orig_qual = pha.quality_filter.copy()
+    orig_mask_full = pha.get_mask().copy()
+
+    assert utils.calc_data_sum(pha, *frange) == pytest.approx(expected)
+
+    assert pha.quality_filter == pytest.approx(orig_qual)
+    assert pha.mask is True
+    assert pha.get_mask() == pytest.approx(orig_mask_full)
+
+    pha.ignore(**ignore_args)
+
+    # The mask has changed, so copy over the values
+    orig_mask2 = pha.mask.copy()
+    orig_mask_full2 = pha.get_mask().copy()
+
+    # The summation should not change, but at present it fails.
+    with pytest.raises(DataErr,
+                       match="size mismatch between grouped data and mask: 3 vs 2"):
+        assert utils.calc_data_sum(pha, *frange) == pytest.approx(expected)
+
+    # The failure has caused the filter state to be lost
+    assert pha.quality_filter is None
+    # assert pha.mask == pytest.approx(orig_mask2)
+    # assert pha.get_mask() == pytest.approx(orig_mask_full2)
 
 
 @pytest.mark.parametrize("data_class", ["2d", "img", "2dint", "imgint"])
